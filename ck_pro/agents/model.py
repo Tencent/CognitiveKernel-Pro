@@ -229,6 +229,80 @@ class Boto3Helper:
         return response
 
 
+class LiteLLMHelper:
+    """Routes calls through the LiteLLM SDK so any of LiteLLM's 100+ supported
+    providers (OpenAI, Anthropic, Bedrock, Vertex, Cohere, Mistral, Groq,
+    Perplexity, Together, Fireworks, Cerebras, ...) are reachable from the
+    same `LLM(call_target="litellm:<model>")` shape.
+
+    LiteLLM resolves backing-provider credentials internally per call (e.g.
+    `ANTHROPIC_API_KEY` for `anthropic/...`, `OPENAI_API_KEY` for `openai/...`,
+    `AWS_*` for `bedrock/...`); no extra env wiring is needed beyond what each
+    backing already documents. Environment-variable overrides per call_target
+    follow the same convention as OpenaiHelper:
+
+    - `LITELLM_API_KEY[_<call_target_suffix>]`         optional proxy / override key
+    - `LITELLM_API_BASE[_<call_target_suffix>]`        optional proxy URL
+    - `LITELLM_API_VERSION[_<call_target_suffix>]`     optional (Azure-style)
+    """
+
+    @staticmethod
+    def call_chat(messages, stat=None, **litellm_kwargs):
+        rprint(f"Call litellm with litellm_kwargs={litellm_kwargs}")
+        import litellm
+
+        model_name = litellm_kwargs["model"]
+        suffix = f"_{model_name}" if model_name else ""
+
+        # Hand explicit api_key / api_base to litellm.completion when set; LiteLLM
+        # falls back to backing-provider env vars (ANTHROPIC_API_KEY etc.) otherwise.
+        api_key = GET_ENV_VAR("LITELLM_API_KEY", f"LITELLM_API_KEY{suffix}")
+        api_base = GET_ENV_VAR("LITELLM_API_BASE", f"LITELLM_API_BASE{suffix}")
+        api_version = GET_ENV_VAR("LITELLM_API_VERSION", f"LITELLM_API_VERSION{suffix}")
+
+        call_kwargs = dict(litellm_kwargs)
+        if api_key:
+            call_kwargs.setdefault("api_key", api_key)
+        if api_base:
+            call_kwargs.setdefault("api_base", api_base)
+        if api_version:
+            call_kwargs.setdefault("api_version", api_version)
+        # `drop_params=True` lets LiteLLM strip kwargs the chosen backing doesn't
+        # accept (e.g. presence_penalty for Anthropic), matching the existing
+        # OpenaiHelper's tolerant-of-extras behavior.
+        call_kwargs.setdefault("drop_params", True)
+
+        chat_completion = litellm.completion(messages=messages, **call_kwargs)
+        call_return = chat_completion.model_dump() if hasattr(chat_completion, "model_dump") else chat_completion.to_dict()
+        update_stat(stat, call_return)
+
+        choices = call_return.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"Get empty choices from litellm: {call_return}")
+        message = choices[0].get("message") or {}
+        response = message.get("content")
+        # Reasoning models (o1, GPT-5, Claude extended-thinking) sometimes put the
+        # answer in reasoning_content / thinking when content is empty.
+        if not response or not response.strip():
+            response = (
+                message.get("reasoning_content")
+                or message.get("thinking")
+                or message.get("output")
+                or ""
+            )
+            if isinstance(response, list):
+                parts = []
+                for part in response:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+                    elif isinstance(part, str):
+                        parts.append(part)
+                response = "\n\n".join(parts)
+        if not isinstance(response, str) or not response.strip():
+            raise RuntimeError(f"Get empty response from litellm: {call_return}")
+        return response
+
+
 class LLM(KwargsInitializable):
     def __init__(self, **kwargs):
         # basics
@@ -285,6 +359,8 @@ class LLM(KwargsInitializable):
             return "request"
         elif _trg.startswith("claude:"):
             return "claude"
+        elif _trg.startswith("litellm:"):
+            return "litellm"
         else:
             raise RuntimeError(f"UNK call_target = {_trg}")
 
@@ -321,6 +397,8 @@ class LLM(KwargsInitializable):
         elif _call_target_type == "claude":
             _call_kwargs['thinking'] = self.thinking or self.thinking == "True"
             ret = self._call_claude_chat(messages, **_call_kwargs)
+        elif _call_target_type == "litellm":
+            ret = self._call_litellm_chat(messages, **_call_kwargs)
         elif _call_target_type == "request":
             messages = self.message_truncator.truncate_message_list(messages, self.max_token_num)
             headers = {"Content-Type": "application/json"}
@@ -381,6 +459,30 @@ class LLM(KwargsInitializable):
                     break
                 else:
                     break
+        return None
+
+    def _call_litellm_chat(self, messages, **kwargs):
+        # `litellm:<model>` -- the model string after the prefix is passed
+        # straight to litellm.completion (e.g. `litellm:anthropic/claude-sonnet-4-6`,
+        # `litellm:openai/gpt-4o`, `litellm:bedrock/anthropic.claude-3-5-sonnet-...`).
+        _litellm_kwargs = {"model": self.call_target.split(":", 1)[1]}
+        _litellm_kwargs.update(kwargs)
+        while True:
+            try:
+                ret = LiteLLMHelper.call_chat(messages, stat=self.call_stat, **_litellm_kwargs)
+                return ret
+            except Exception as e:
+                rprint(f"Get error when calling litellm: {e}", style="white on red")
+                exc_name = type(e).__name__
+                if exc_name in ["RateLimitError", "Timeout"]:
+                    time.sleep(10)
+                    continue
+                if exc_name == "BadRequestError":
+                    error_str = str(e)
+                    if "ResponsibleAIPolicyViolation" in error_str or "content_filter" in error_str:
+                        return "Thought: Jailbreak or content filter violation detected. Please modify your prompt or stop with N/A."
+                    rprint(f"BadRequestError: {error_str}", style="white on red")
+                break
         return None
 
     def _call_claude_chat(self, messages, **kwargs):
