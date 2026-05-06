@@ -102,6 +102,9 @@ class SimpleSearchTool(Tool):
             self.ddgs_params = kwargs.copy()
         elif target == "Google":
             self.google_params = {"key": GET_ENV_VAR("SEARCH_API_KEY"), "cx": GET_ENV_VAR("SEARCH_CSE_ID")}
+        elif target == "Tavily":
+            from tavily import TavilyClient
+            self.tavily_client = TavilyClient(api_key=GET_ENV_VAR("TAVILY_API_KEY"))
         else:
             raise ValueError(f"UNK search target = {target}")
         # --
@@ -147,6 +150,10 @@ def simple_web_search(query: str) -> str:
             response = requests.get(url, params=params)
             results = response.json()
             search_results = [{"title": _item["title"], "link": _item["link"], "content": _item["snippet"]} for _item in results.get("items", [])]
+        elif target == "Tavily":
+            rprint(f"Query tavily with: query={query}, max_results={self.max_results}")
+            results = self.tavily_client.search(query, max_results=self.max_results)
+            search_results = [{"title": _item["title"], "link": _item["url"], "content": _item["content"]} for _item in results.get("results", [])]
         else:
             raise ValueError(f"UNK search target = {target}")
         # --
