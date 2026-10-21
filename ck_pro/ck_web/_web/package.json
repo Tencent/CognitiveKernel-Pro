@@ -1,6 +1,6 @@
 {
     "name": "playwright-express-app",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "A simple Express server to navigate and interact with web pages using Playwright.",
     "main": "server.js",
     "scripts": {

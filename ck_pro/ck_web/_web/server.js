@@ -212,6 +212,18 @@ app.post('/closeBrowser', async (req, res) => {
   }
 });
 
+const DOWNLOAD_DIR = path.resolve(__dirname, 'DownloadedFiles');
+
+// Only http(s) URLs may be navigated to (blocks file:, data:, etc.)
+function isAllowedUrl(u) {
+  try {
+    const p = new URL(String(u)).protocol;
+    return p === 'http:' || p === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
 app.post('/openPage', async (req, res) => {
   const { browserId, url } = req.body;
 
@@ -236,6 +248,10 @@ app.post('/openPage', async (req, res) => {
   try {
     const page = await browserEntry.browser.newPage();
     await setCustomUserAgent(page);
+    if (!isAllowedUrl(url)) {
+      await page.close();
+      return res.status(400).send({ error: 'Unsupported URL scheme.' });
+    }
     await page.goto(url);
     const pageIdint = Object.keys(browserEntry.pages).length;
     console.log(`current page id:${pageIdint}`)
@@ -884,6 +900,9 @@ app.post('/performAction', async (req, res) => {
         break;
       case 'goto':
         // await page.goto("https://www.google.com");
+        if (!isAllowedUrl(actionValue)) {
+          return res.status(400).send({ error: 'Unsupported URL scheme.' });
+        }
         await page.goto(actionValue, { timeout: 60000 });
         break;
       case 'restart':
@@ -927,6 +946,9 @@ app.post('/gotoUrl', async (req, res) => {
 
   try {
     const page = pageEntry.page;
+    if (!isAllowedUrl(targetUrl)) {
+      return res.status(400).send({ error: 'Unsupported URL scheme.' });
+    }
     console.log(`target url: ${targetUrl}`);
     await page.goto(targetUrl, { timeout: 60000 });
     browserEntry.lastActivity = Date.now();
@@ -1010,10 +1032,14 @@ app.post("/gethtmlcontent", async (req, res) => {
 app.post('/getFile', async (req, res) => {
   try {
     const { filename } = req.body;
-    if (!filename) {
+    if (typeof filename !== 'string' || !filename) {
       return res.status(400).send({ error: 'Filename is required.' });
     }
-    const data = await fs.readFile(filename);  // simply directly read it!
+    const resolved = path.resolve(__dirname, filename);  // relative to server root
+    if (resolved !== DOWNLOAD_DIR && !resolved.startsWith(DOWNLOAD_DIR + path.sep)) {
+      return res.status(403).send({ error: 'Access denied.' });
+    }
+    const data = await fs.readFile(resolved);
     const base64String = data.toString('base64');
     res.send({ file: base64String });
   } catch (err) {
